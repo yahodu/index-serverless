@@ -24,4 +24,4 @@ while ! curl -s http://localhost:18000/health > /dev/null; do
 done
 
 # Start PyWorker (foreground)
-python worker.py
+python3 worker.py
