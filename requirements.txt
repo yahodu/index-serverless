@@ -4,5 +4,5 @@ uvicorn==0.44.0
 httpx==0.28.1
 pymongo==4.16.0
 insightface==0.7.3
-opencv-python==4.13.0
+opencv-python==4.13.0.92
 numpy==2.4.4
