@@ -7,3 +7,4 @@ insightface==0.7.3
 opencv-python==4.13.0.92
 numpy==2.4.4
 onnxruntime-gpu==1.24.4
+python-multipart==0.0.26
