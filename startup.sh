@@ -8,6 +8,8 @@ pip install -r requirements.txt
 mkdir -p ~/.insightface/models
 # Add model download commands if needed
 
+alias python='python3'
+
 # Start face server in background
 python face_server.py > /var/log/face-server.log 2>&1 &
 
