@@ -140,6 +140,11 @@ if [ "${USE_SYSTEM_PYTHON:-}" = "true" ]; then
             fi
         fi
     fi
+
+    if ! uv pip install -r "${SERVER_DIR}/requirements.txt"; then
+        report_error_and_exit "Failed to install Python requirements"
+    fi
+
     install_vastai_sdk
     touch ~/.no_auto_tmux
 elif [ ! -d "$ENV_PATH" ]; then
