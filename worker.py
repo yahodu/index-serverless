@@ -17,51 +17,45 @@ worker_config = WorkerConfig(
     model_log_file="/var/log/face-server.log",
     
     handlers=[
-        # /index endpoint - indexing faces
+        # /index endpoint - indexing faces (MAIN OPERATION)
         HandlerConfig(
             route="/index",
-            method="POST",
-            allow_parallel_requests=True,  # Can handle concurrent requests
-            max_queue_time=120.0,  # Allow up to 2 minutes in queue
-            workload_calculator=lambda payload: 100.0,  # Fixed cost per index request
-            benchmark_config=None,  # Benchmark only on /search
-        ),
-        
-        # /search endpoint - searching for faces
-        HandlerConfig(
-            route="/search",
-            method="POST",
             allow_parallel_requests=True,
-            max_queue_time=60.0,
-            workload_calculator=lambda payload: float(payload.get("threshold", 0.45)) * 1000,  # Cost based on threshold
+            max_queue_time=120.0,
+            workload_calculator=lambda payload: 100.0,  # Fixed cost per index request
             benchmark_config=BenchmarkConfig(
-                # Benchmark payload - adjust with real test image URL
+                # Benchmark payload for indexing - adjust with your actual index request format
                 generator=lambda: {
                     "image_url": "https://link.storjshare.io/raw/jvzvldih7dypc4ra2ats62jmtgzq/family/chechi-engagement/standard-quality/AVC 0051.JPG",
-                    "threshold": 0.5
+                    # Add any other fields your index endpoint expects:
+                    # "face_id": "benchmark_face_001",
+                    # "metadata": {"name": "Test Face"},
                 },
                 runs=5,
                 concurrency=4,
             ),
         ),
         
+        # /search endpoint - searching for faces
+        HandlerConfig(
+            route="/search",
+            allow_parallel_requests=True,
+            max_queue_time=60.0,
+            workload_calculator=lambda payload: float(payload.get("threshold", 0.45)) * 1000,
+        ),
+        
         # /health endpoint
         HandlerConfig(
             route="/health",
-            method="GET",
             allow_parallel_requests=True,
             max_queue_time=10.0,
-            workload_calculator=lambda payload: 1.0,  # Minimal cost
-            benchmark_config=None,
+            workload_calculator=lambda payload: 1.0,
         ),
     ],
     
     log_action_config=LogActionConfig(
-        # Pattern to detect when your server is ready
         on_load=["Application startup complete"],
-        # Patterns to detect errors
         on_error=["Traceback (most recent call last):", "ERROR", "CRITICAL"],
-        # Info patterns (optional)
         on_info=["INFO", "Model loaded"],
     ),
 )
