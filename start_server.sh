@@ -185,7 +185,7 @@ elif [ ! -d "$ENV_PATH" ]; then
         fi
     fi
 
-    if ! uv venv --python-preference only-managed "$ENV_PATH" -p 3.10; then
+    if ! uv venv --python-preference only-managed "$ENV_PATH" -p 3.11; then
         report_error_and_exit "Failed to create virtual environment"
     fi
     
