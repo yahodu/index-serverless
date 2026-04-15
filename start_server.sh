@@ -9,7 +9,7 @@ if [ -f "/.force_update" ]; then
     FORCE_UPDATE=true
 fi
 
-WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
+WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace/face-search}"
 
 SERVER_DIR="$WORKSPACE_DIR"
 ENV_PATH="${ENV_PATH:-$WORKSPACE_DIR/worker-env}"
