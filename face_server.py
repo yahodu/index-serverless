@@ -19,6 +19,8 @@ import uvicorn
 import httpx
 from fastapi import FastAPI, Form
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from typing import Optional
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import PyMongoError
 from insightface.app import FaceAnalysis
@@ -137,16 +139,23 @@ def timing(label: str, t0: float) -> float:
 
 # ─── /index ───────────────────────────────────────────────────────────────────
 
+class IndexImageRequest(BaseModel):
+    image_url: str = Field(..., description="Storj object URL")
+    image_path: Optional[str] = Field(
+        None,
+        description="Logical path/name (defaults to image_url if not provided)"
+    )
+    overwrite: bool = Field(
+        False,
+        description="Replace existing document for this path"
+    )
+
 @app.post("/index")
-async def index_image(
-    image_url: str  = Form(...),            # Storj object URL
-    image_path: str = Form(None),           # logical path/name (defaults to URL if not provided)
-    overwrite: bool = Form(False),          # if True, replace existing doc for this path
-):
-    # Use URL as image_path if not provided
-    if image_path is None:
-        image_path = image_url
-    
+async def index_image(request: IndexImageRequest):
+    image_url = request.image_url
+    image_path = request.image_path or image_url
+    overwrite = request.overwrite
+
     request_id = f"idx-{int(time.time()*1000)}"
     log.info(f"[{request_id}] /index | image_url={image_url} | image_path={image_path} | overwrite={overwrite}")
     t_request = time.perf_counter()

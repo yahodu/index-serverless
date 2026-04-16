@@ -25,12 +25,19 @@ worker_config = WorkerConfig(
             workload_calculator=lambda payload: 100.0,  # Fixed cost per index request
             benchmark_config=BenchmarkConfig(
                 # Benchmark payload for indexing - adjust with your actual index request format
-                generator=lambda: {
-                    "image_url": "https://link.storjshare.io/raw/jvzvldih7dypc4ra2ats62jmtgzq/family/chechi-engagement/standard-quality/AVC 0051.JPG",
-                    # Add any other fields your index endpoint expects:
-                    # "face_id": "benchmark_face_001",
-                    # "metadata": {"name": "Test Face"},
-                },
+                # generator=lambda: {
+                #     "image_url": "https://link.storjshare.io/raw/jvzvldih7dypc4ra2ats62jmtgzq/family/chechi-engagement/standard-quality/AVC 0051.JPG",
+                #     # Add any other fields your index endpoint expects:
+                #     # "face_id": "benchmark_face_001",
+                #     # "metadata": {"name": "Test Face"},
+                # },
+                dataset=[
+                    {
+                        "image_url": "https://link.storjshare.io/raw/jxcy5wbsh36pwrtof5e73dzs5gwq/family/chechi-engagement/standard-quality/AVC 0089.JPG",
+                        "image_path": "/users/john/photo1.jpg",
+                        "overwrite": "false"
+                    }
+                ],
                 runs=5,
                 concurrency=4,
             ),
