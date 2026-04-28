@@ -2,22 +2,24 @@
 """
 Step 2: Generate teacher landmark labels from MS1MV3.
 
-KEY FACTS for 1k3d68.onnx
-──────────────────────────
+KEY FACTS for 1k3d68.onnx (confirmed from landmark.py source)
+──────────────────────────────────────────────────────────────
   Input resolution : 192 × 192  (MS1MV3 images are 112×112 — resized here)
-  Normalisation    : (RGB - 127.5) / 128.0
+  Preprocessing    : (RGB - 127.5) / 128.0,  NHWC -> NCHW
   Raw output       : (N, 3309)  flat float32
-  Decode           : reshape (N, 68, 3)
-                     xy  = (xy  + 1) * 96    pixel-space
-                     z   =  z        * 96    relative depth
+  Decode           :
+    reshape (N, 1103, 3)
+    take last 68 rows  -> (N, 68, 3)
+    xy  = (xy + 1) * 96    pixel-space [0, 192]
+    z   =  z       * 96    same scale
 
 STORAGE per chunk of 10 000 samples
 ─────────────────────────────────────
-  images     : 10 000 × 192 × 192 × 3  uint8  ≈ 1.06 GB
-  landmarks  : 10 000 × 68  × 3        float32 ≈  7.8 MB
-  total                                         ≈ 1.07 GB / chunk
+  images     : 10 000 × 192 × 192 × 3  uint8    ≈ 1 059 MB
+  landmarks  : 10 000 × 68  × 3        float32  ≈     7.8 MB
+  total                                          ≈ 1 067 MB / chunk
 
-At 1 000 000 samples (100 chunks) → ≈ 107 GB images + 0.78 GB landmarks
+At 1 000 000 samples (100 chunks) -> ≈ 106 GB images + 0.78 GB landmarks
 """
 
 import os
@@ -30,55 +32,63 @@ from tqdm import tqdm
 from pathlib import Path
 
 
-# ============================================================
-# Constants
-# ============================================================
-
-INPUT_SIZE   = 192          # 1k3d68 input resolution
-INPUT_MEAN   = 127.5
-INPUT_STD    = 128.0
-OUTPUT_FLAT  = 3309         # 68 * 3 * ~  (confirmed by inspect)
-NUM_LMK      = 68
-LMK_DIM      = 3
+# ── Constants ─────────────────────────────────────────────────────────────────
+INPUT_SIZE  = 192
+INPUT_MEAN  = 127.5
+INPUT_STD   = 128.0
+OUTPUT_FLAT = 3309
+NUM_LMK     = 68
+LMK_DIM     = 3
 
 
-# ============================================================
-# Landmark decoding (mirrors insightface/model_zoo/landmark.py)
-# ============================================================
+# ── Landmark decoding (mirrors landmark.py exactly) ────────────────────────────
 
 def decode_landmarks(raw: np.ndarray, input_size: int = INPUT_SIZE) -> np.ndarray:
     """
-    raw  : (N, 3309) float32
-    out  : (N, 68, 3) float32  — xy in [0, input_size], z same scale
+    raw  : (N, 3309) float32   raw session output
+    out  : (N, 68, 3) float32  decoded pixel-space landmarks
+
+    Decoding steps from landmark.py:
+      pred = raw[i]                      # (3309,)
+      pred = pred.reshape((-1, 3))       # (1103, 3)  — 3309 / 3 = 1103
+      pred = pred[68 * -1 :, :]          # (68, 3)    — last 68 rows only
+      pred[:, 0:2] += 1
+      pred[:, 0:2] *= 96
+      pred[:, 2]   *= 96
     """
-    half = input_size // 2
-    lmks = raw.reshape(raw.shape[0], NUM_LMK, LMK_DIM).copy()
-    lmks[:, :, 0:2] += 1.0
-    lmks[:, :, 0:2] *= half
-    lmks[:, :, 2]   *= half
+    half  = input_size // 2   # 96
+    N     = raw.shape[0]
+    lmks  = np.empty((N, NUM_LMK, LMK_DIM), dtype=np.float32)
+
+    for i in range(N):
+        pred = raw[i].reshape(-1, LMK_DIM)   # (1103, 3)
+        pred = pred[NUM_LMK * -1:, :].copy() # (68, 3)
+        pred[:, 0:2] += 1.0
+        pred[:, 0:2] *= half
+        pred[:, 2]   *= half
+        lmks[i] = pred
+
     return lmks
 
 
-# ============================================================
-# MXNet RecordIO reader  (same as glintr100 version, resize added)
-# ============================================================
+# ── MXNet RecordIO reader ──────────────────────────────────────────────────────
 
 class MXRecordDatasetReader:
     """
     Pure-Python MXNet RecordIO reader — no MXNet dependency.
-    MS1MV3 images are 112×112 JPEG; we resize to 192×192 on read.
+    MS1MV3 images are stored as 112×112 JPEGs; resized to 192×192 on read.
 
-    Binary layout:
-      [0:4]  magic      uint32 LE  0xced7230a
-      [4:8]  encoded    uint32 LE  upper 3 bits = cflag, lower 29 bits = data_len/4
-      [8:24] index+id   16 bytes   skipped
-      [24:]  payload
+    Binary layout per record:
+      [0:4]   magic      uint32 LE   must == 0xced7230a
+      [4:8]   encoded    uint32 LE   lower 29 bits = data_len/4
+      [8:24]  index+id   16 bytes    skipped
+      [24:]   payload
 
     InsightFace payload layout:
-      [0:16]  label header   (16 bytes)
-      [16:]   JPEG bytes     (starts ff d8 ff)
+      [0:16]  label header  (16 bytes, skipped)
+      [16:]   JPEG bytes    (starts ff d8 ff)
 
-    Key=0 is the dataset header record — always skipped.
+    Key=0 is always the dataset header record — skipped.
     """
 
     _MAGIC     = 0xced7230a
@@ -88,7 +98,7 @@ class MXRecordDatasetReader:
                  target_size: int = INPUT_SIZE):
         self.target_size = target_size
 
-        self.offsets: dict[int, int] = {}
+        self.offsets: dict = {}
         with open(idx_path, 'r') as f:
             for line in f:
                 line = line.strip()
@@ -100,8 +110,8 @@ class MXRecordDatasetReader:
 
         all_keys    = sorted(self.offsets.keys())
         self.keys   = [k for k in all_keys if k != 0]
-        print(f"Dataset: {len(self.keys)} images "
-              f"(skipped 1 header, {len(all_keys)} total keys)")
+        print(f"Dataset: {len(self.keys):,} images "
+              f"(skipped 1 header, {len(all_keys):,} total keys)")
 
         self._rec_file = open(rec_path, 'rb')
 
@@ -139,9 +149,7 @@ class MXRecordDatasetReader:
     def read_image(self, index: int) -> np.ndarray:
         """
         Returns (192, 192, 3) uint8 RGB.
-        MS1MV3 source images are 112×112 — resized to 192×192 here.
-        Bilinear resize is sufficient; the teacher never saw sub-pixel
-        detail beyond what 112px contains anyway.
+        MS1MV3 source images are 112×112; bilinear resize to 192×192 applied here.
         """
         key    = self.keys[index]
         offset = self.offsets[key]
@@ -155,10 +163,8 @@ class MXRecordDatasetReader:
             )
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         if img.shape[:2] != (self.target_size, self.target_size):
-            img = cv2.resize(
-                img, (self.target_size, self.target_size),
-                interpolation=cv2.INTER_LINEAR,
-            )
+            img = cv2.resize(img, (self.target_size, self.target_size),
+                             interpolation=cv2.INTER_LINEAR)
         return img
 
     def read_batch(self, indices: list) -> np.ndarray:
@@ -171,19 +177,15 @@ class MXRecordDatasetReader:
         return np.stack(images, axis=0) if images else np.array([])
 
 
-# ============================================================
-# Teacher Landmark Generator
-# ============================================================
+# ── Teacher Landmark Generator ─────────────────────────────────────────────────
 
 class TeacherLandmarkGenerator:
     """
     Runs 1k3d68.onnx on batches of face images and stores decoded
     landmark coordinates.
 
-    Preprocessing mirrors insightface/model_zoo/landmark.py exactly:
-      blob = cv2.dnn.blobFromImage(img, 1/128.0, (192,192), (127.5,)*3, swapRB=True)
-    which is equivalent to:
-      (RGB_float - 127.5) / 128.0,  transposed to NCHW
+    Preprocessing mirrors cv2.dnn.blobFromImage with swapRB=True:
+      (RGB_float - 127.5) / 128.0  then NHWC -> NCHW
 
     Recommended batch sizes by GPU VRAM:
        4 GB  ->  8
@@ -204,10 +206,10 @@ class TeacherLandmarkGenerator:
         sess_options.log_severity_level   = 3
 
         cuda_options = {
-            "device_id":                0,
-            "arena_extend_strategy":    "kSameAsRequested",
-            "gpu_mem_limit":            int(gpu_mem_limit_gb * 1024**3),
-            "cudnn_conv_algo_search":   "HEURISTIC",
+            "device_id":              0,
+            "arena_extend_strategy":  "kSameAsRequested",
+            "gpu_mem_limit":          int(gpu_mem_limit_gb * 1024 ** 3),
+            "cudnn_conv_algo_search": "HEURISTIC",
         }
 
         self.session = ort.InferenceSession(
@@ -221,47 +223,39 @@ class TeacherLandmarkGenerator:
         self.input_name = self.session.get_inputs()[0].name
         self.batch_size = batch_size
 
-        # Detect normalisation from graph
-        import onnx as _onnx
-        _model     = _onnx.load(onnx_path)
-        find_sub   = find_mul = False
-        for nid, node in enumerate(_model.graph.node[:8]):
-            if node.name.startswith('Sub') or node.name.startswith('_minus'):
-                find_sub = True
-            if node.name.startswith('Mul') or node.name.startswith('_mul'):
-                find_mul = True
-            if nid < 3 and node.name == 'bn_data':
-                find_sub = find_mul = True
-        self.input_mean = 0.0   if (find_sub and find_mul) else INPUT_MEAN
-        self.input_std  = 1.0   if (find_sub and find_mul) else INPUT_STD
+        # Validate output size immediately
+        out_size = self.session.get_outputs()[0].shape[1]
+        assert out_size == OUTPUT_FLAT, (
+            f"Expected output size {OUTPUT_FLAT}, got {out_size}. Wrong model?"
+        )
 
         print(f"Teacher model loaded : {onnx_path}")
         print(f"  Batch size         : {batch_size}")
         print(f"  GPU mem cap        : {gpu_mem_limit_gb} GB")
-        print(f"  Normalisation      : mean={self.input_mean}, std={self.input_std}")
+        print(f"  Preprocessing      : (RGB - {INPUT_MEAN}) / {INPUT_STD}")
+        print(f"  Output decode      : reshape(1103,3) -> last 68 rows -> scale by 96")
         print(f"  Providers          : {self.session.get_providers()}")
 
     def preprocess(self, images: np.ndarray) -> np.ndarray:
         """
         Input  : (N, 192, 192, 3) uint8 RGB
-        Output : (N, 3,   192, 192) float32
+        Output : (N, 3, 192, 192) float32
 
-        Mirrors cv2.dnn.blobFromImage with swapRB=True:
-          output = (input_RGB - mean) / std  then NHWC -> NCHW
+        Mirrors cv2.dnn.blobFromImage(img, 1/128.0, (192,192), (127.5,)*3, swapRB=True)
         """
         imgs = images.astype(np.float32)
-        imgs = (imgs - self.input_mean) / self.input_std
+        imgs = (imgs - INPUT_MEAN) / INPUT_STD
         imgs = imgs.transpose(0, 3, 1, 2)   # NHWC -> NCHW
-        return imgs
+        return np.ascontiguousarray(imgs)
 
     def get_landmarks(self, images: np.ndarray) -> np.ndarray:
         """
         Input  : (N, 192, 192, 3) uint8 RGB
         Output : (N, 68, 3)       float32  decoded pixel-space landmarks
         """
-        preprocessed = self.preprocess(images)
-        raw          = self.session.run(None, {self.input_name: preprocessed})[0]
-        return decode_landmarks(raw, input_size=INPUT_SIZE)
+        blob = self.preprocess(images)
+        raw  = self.session.run(None, {self.input_name: blob})[0]   # (N, 3309)
+        return decode_landmarks(raw)
 
     @staticmethod
     def _save_chunk(path: str, images: np.ndarray, landmarks: np.ndarray):
@@ -279,21 +273,23 @@ class TeacherLandmarkGenerator:
         rec_path:    str,
         idx_path:    str,
         output_dir:  str,
-        max_samples: int  = None,
-        chunk_size:  int  = 10_000,
+        max_samples: int = None,
+        chunk_size:  int = 10_000,
     ):
         """
         Full pipeline: read MS1MV3 .rec -> run teacher -> save .npz chunks.
 
         chunk_size=10_000 keeps each chunk ≈ 1.07 GB (images dominate).
-        Reduce to 5_000 if RAM is tight during concatenation.
+        Reduce to 5_000 if disk writes are slow or RAM is tight.
         """
         os.makedirs(output_dir, exist_ok=True)
         reader = MXRecordDatasetReader(rec_path, idx_path, target_size=INPUT_SIZE)
 
         total = min(len(reader), max_samples) if max_samples else len(reader)
-        print(f"\nProcessing {total:,} images  |  chunk_size={chunk_size}")
-        print(f"Output -> {output_dir}")
+        print(f"\nProcessing {total:,} images  |  chunk_size={chunk_size:,}")
+        print(f"Storage estimate : {total * INPUT_SIZE * INPUT_SIZE * 3 / 1e9:.1f} GB images  "
+              f"+ {total * NUM_LMK * LMK_DIM * 4 / 1e6:.0f} MB landmarks")
+        print(f"Output -> {output_dir}\n")
 
         chunk_images    = []
         chunk_landmarks = []
@@ -324,13 +320,10 @@ class TeacherLandmarkGenerator:
                 chunk_file = os.path.join(output_dir, f"chunk_{chunk_idx:04d}.npz")
                 self._save_chunk(chunk_file, all_imgs, all_lmks)
 
-                img_mb = all_imgs.nbytes / 1e6
-                lmk_mb = all_lmks.nbytes / 1e6
-                print(
-                    f"\n  Saved {chunk_file}  "
-                    f"{all_imgs.shape[0]:,} samples  "
-                    f"images={img_mb:.0f} MB  landmarks={lmk_mb:.1f} MB"
-                )
+                print(f"\n  Saved {chunk_file}  "
+                      f"{all_imgs.shape[0]:,} samples  "
+                      f"images={all_imgs.nbytes / 1e6:.0f} MB  "
+                      f"landmarks={all_lmks.nbytes / 1e6:.1f} MB")
 
                 chunk_images    = []
                 chunk_landmarks = []
@@ -338,12 +331,10 @@ class TeacherLandmarkGenerator:
                 chunk_count     = 0
 
         pbar.close()
-        print(f"\nDone — {chunk_idx} chunk(s) saved to {output_dir}")
+        print(f"\nDone — {chunk_idx} chunk(s) written to {output_dir}")
 
 
-# ============================================================
-# Sanity checks
-# ============================================================
+# ── Sanity checks ──────────────────────────────────────────────────────────────
 
 def sanity_check_reader(rec_path: str, idx_path: str, n: int = 5) -> bool:
     print("\n=== Sanity check: RecordIO reader ===")
@@ -352,8 +343,8 @@ def sanity_check_reader(rec_path: str, idx_path: str, n: int = 5) -> bool:
     for i in range(min(n, len(reader))):
         try:
             img = reader.read_image(i)
-            assert img.shape  == (INPUT_SIZE, INPUT_SIZE, 3), img.shape
-            assert img.dtype  == np.uint8
+            assert img.shape == (INPUT_SIZE, INPUT_SIZE, 3), img.shape
+            assert img.dtype == np.uint8
             print(f"  [{i}] shape={img.shape} dtype={img.dtype} "
                   f"min={img.min()} max={img.max()}  OK")
             ok += 1
@@ -364,24 +355,23 @@ def sanity_check_reader(rec_path: str, idx_path: str, n: int = 5) -> bool:
 
 
 def sanity_check_model(gen: TeacherLandmarkGenerator, n: int = 2) -> bool:
-    print("\n=== Sanity check: ONNX model ===")
-    dummy = np.random.randint(0, 255, (n, INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
+    print("\n=== Sanity check: ONNX model + decode ===")
+    dummy = np.random.randint(0, 256, (n, INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
     try:
         lmks = gen.get_landmarks(dummy)
         assert lmks.shape == (n, NUM_LMK, LMK_DIM), f"Bad shape: {lmks.shape}"
         print(f"  Output shape : {lmks.shape}  OK   (N, 68, 3)")
-        print(f"  x range      : [{lmks[:,:,0].min():.2f}, {lmks[:,:,0].max():.2f}]")
-        print(f"  y range      : [{lmks[:,:,1].min():.2f}, {lmks[:,:,1].max():.2f}]")
+        print(f"  x range      : [{lmks[:,:,0].min():.2f}, {lmks[:,:,0].max():.2f}]  (expect ~0–{INPUT_SIZE})")
+        print(f"  y range      : [{lmks[:,:,1].min():.2f}, {lmks[:,:,1].max():.2f}]  (expect ~0–{INPUT_SIZE})")
         print(f"  z range      : [{lmks[:,:,2].min():.4f}, {lmks[:,:,2].max():.4f}]")
         return True
     except Exception as e:
         print(f"  FAILED: {e}")
+        import traceback; traceback.print_exc()
         return False
 
 
-# ============================================================
-# Main
-# ============================================================
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 

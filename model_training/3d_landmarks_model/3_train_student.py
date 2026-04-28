@@ -1,38 +1,31 @@
 # 3_train_student.py
 """
-Step 3: Train a student landmark model via knowledge distillation.
+Step 3: Train a student 3D landmark model via knowledge distillation.
 
-TASK SUMMARY
-────────────
-  Teacher  : 1k3d68.onnx  ResNet-50  34.2 M params
-  Input    : (N, 3, 192, 192) float32   mean=127.5  std=128.0
-  Output   : (N, 68, 3) float32   pixel-space landmarks
-
-STUDENT OUTPUT
-──────────────
-  Same format: (N, 68, 3)
-  No L2-normalisation — raw coordinate regression, not embedding matching.
+TASK
+────
+  Teacher : 1k3d68.onnx  ResNet-50  34.2 M params
+  Student : ResNet-style CNN  output (N, 68, 3) raw coordinates
+  Labels  : decoded teacher landmarks stored by 2_prepare_dataset.py
 
 LOSS
 ────
-  Wing loss  (standard for face landmark regression, CVPR 2018)
-  + L1 loss  (robust to outliers, stabilises training)
-  + MSE loss (penalises large errors hard)
-
-  All losses computed on decoded coordinates directly.
-  z is down-weighted because its scale (~±48 px) matches xy (~0-192 px),
-  but z has higher uncertainty — empirically weight 0.5 works well.
+  Wing loss  on xy  — standard face alignment loss (CVPR 2018)
+  L1  loss   on xyz — robust to outliers
+  MSE loss   on xyz — hard penalty on large errors
+  z is down-weighted (higher label uncertainty than xy)
 
 METRIC
 ──────
-  NME% (Normalised Mean Error) — inter-ocular distance normalised.
-  Standard face alignment metric. Good models: NME < 4% on 300W.
-  Reported every epoch on a held-out validation split.
+  NME% — Normalised Mean Error, inter-ocular distance normalised.
+  Good student target: NME < 4% (teacher on aligned crops ~2–3%).
 
-DATASET MODES (auto-selected)
-──────────────────────────────
-  DistillationDataset      — loads all into RAM  (fast, needs ~107 GB+)
-  LargeDistillationDataset — streams from disk   (slower, any RAM)
+AUGMENTATION NOTE
+─────────────────
+  Horizontal flip is intentionally OMITTED.
+  Flipping a face image requires remapping the 68 landmark indices
+  (e.g. left-eye <-> right-eye), which is non-trivial and error-prone.
+  ColorJitter and GaussianBlur are safe — they don't affect coordinates.
 """
 
 import os
@@ -51,21 +44,18 @@ from tqdm import tqdm
 from datetime import datetime
 
 
-# ============================================================
-# Constants (must match 2_prepare_dataset.py)
-# ============================================================
-
+# ── Constants ──────────────────────────────────────────────────────────────────
 INPUT_SIZE = 192
 NUM_LMK    = 68
 LMK_DIM    = 3
 
 
-# ============================================================
-# Student Model Architecture
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# Student Model
+# ══════════════════════════════════════════════════════════════════════════════
 
 class ConvBnAct(nn.Module):
-    """Conv -> BN -> PReLU"""
+    """Conv2d -> BN -> PReLU"""
     def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
         super().__init__()
         self.block = nn.Sequential(
@@ -79,7 +69,7 @@ class ConvBnAct(nn.Module):
 
 
 class ResBlock(nn.Module):
-    """Pre-activation residual block."""
+    """Standard residual block."""
     def __init__(self, ch):
         super().__init__()
         self.block = nn.Sequential(
@@ -103,34 +93,31 @@ def _make_layer(in_ch: int, out_ch: int, n_blocks: int, stride: int = 2) -> nn.S
 
 class LandmarkHead(nn.Module):
     """
-    Regression head: global-avg-pool -> dropout -> FC -> reshape (N, 68, 3).
-    No BN on the output — landmark coordinates are unbounded real numbers.
+    Regression head -> (N, 68, 3).
+    No BatchNorm on output — landmark coordinates are unbounded reals.
     """
-    def __init__(self, in_features: int, num_lmk: int = NUM_LMK, lmk_dim: int = LMK_DIM,
-                 dropout: float = 0.0):
+    def __init__(self, in_features: int, dropout: float = 0.0):
         super().__init__()
-        self.num_lmk = num_lmk
-        self.lmk_dim = lmk_dim
-        layers: list[nn.Module] = []
+        layers: list = []
         if dropout > 0:
             layers.append(nn.Dropout(p=dropout))
-        layers.append(nn.Linear(in_features, num_lmk * lmk_dim))
+        layers.append(nn.Linear(in_features, NUM_LMK * LMK_DIM))
         self.fc = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(x).view(x.size(0), self.num_lmk, self.lmk_dim)
+        return self.fc(x).view(x.size(0), NUM_LMK, LMK_DIM)
 
 
 class StudentModelSmall(nn.Module):
-    """~2 M params. Fast iteration / ablation."""
+    """~2 M params. For quick iteration / ablation only."""
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
-            ConvBnAct(3,   64,  s=2),    # 192 -> 96
+            ConvBnAct(3,   64,  s=2),       # 192->96
             ResBlock(64),
-            _make_layer(64,  128, 2, 2), # 96  -> 48
-            _make_layer(128, 256, 2, 2), # 48  -> 24
-            _make_layer(256, 512, 2, 2), # 24  -> 12
+            _make_layer(64,  128, 2, 2),    # 96->48
+            _make_layer(128, 256, 2, 2),    # 48->24
+            _make_layer(256, 512, 2, 2),    # 24->12
         )
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.head = LandmarkHead(512, dropout=0.2)
@@ -145,13 +132,13 @@ class StudentModelMedium(nn.Module):
     """~10 M params."""
     def __init__(self):
         super().__init__()
-        self.stem    = ConvBnAct(3, 64, s=1)
-        self.layer1  = _make_layer(64,  64,  3, 2)
-        self.layer2  = _make_layer(64,  128, 4, 2)
-        self.layer3  = _make_layer(128, 256, 6, 2)
-        self.layer4  = _make_layer(256, 512, 3, 2)
-        self.pool    = nn.AdaptiveAvgPool2d((1, 1))
-        self.head    = LandmarkHead(512, dropout=0.3)
+        self.stem   = ConvBnAct(3, 64, s=1)
+        self.layer1 = _make_layer(64,  64,  3, 2)
+        self.layer2 = _make_layer(64,  128, 4, 2)
+        self.layer3 = _make_layer(128, 256, 6, 2)
+        self.layer4 = _make_layer(256, 512, 3, 2)
+        self.pool   = nn.AdaptiveAvgPool2d((1, 1))
+        self.head   = LandmarkHead(512, dropout=0.3)
 
     def forward(self, x):
         x = self.stem(x)
@@ -165,18 +152,18 @@ class StudentModelMedium(nn.Module):
 
 class StudentModelLarge(nn.Module):
     """
-    ~25 M params. IResNet-50 style.
-    Closest to teacher (ResNet-50, 34.2 M) — recommended.
+    ~25 M params. IResNet-50 style — closest to teacher depth.
+    Recommended for H200 / any GPU with ≥ 16 GB VRAM.
     """
     def __init__(self):
         super().__init__()
-        self.stem    = ConvBnAct(3, 64, s=1)
-        self.layer1  = _make_layer(64,  64,   3,  2)   # 192->96
-        self.layer2  = _make_layer(64,  128,  8,  2)   # 96 ->48
-        self.layer3  = _make_layer(128, 256,  16, 2)   # 48 ->24
-        self.layer4  = _make_layer(256, 512,  3,  2)   # 24 ->12
-        self.pool    = nn.AdaptiveAvgPool2d((1, 1))
-        self.head    = LandmarkHead(512, dropout=0.4)
+        self.stem   = ConvBnAct(3, 64, s=1)
+        self.layer1 = _make_layer(64,  64,   3,  2)    # 192->96
+        self.layer2 = _make_layer(64,  128,  8,  2)    # 96->48
+        self.layer3 = _make_layer(128, 256,  16, 2)    # 48->24
+        self.layer4 = _make_layer(256, 512,  3,  2)    # 24->12
+        self.pool   = nn.AdaptiveAvgPool2d((1, 1))
+        self.head   = LandmarkHead(512, dropout=0.4)
 
     def forward(self, x):
         x = self.stem(x)
@@ -188,24 +175,20 @@ class StudentModelLarge(nn.Module):
         return self.head(x)
 
 
-# ============================================================
-# Loss Function
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# Loss
+# ══════════════════════════════════════════════════════════════════════════════
 
 class LandmarkDistillationLoss(nn.Module):
     """
-    Combined regression loss for 3D landmark distillation.
+    Wing loss on xy + L1 + MSE on weighted xyz.
 
-    loss = alpha_wing * WingLoss(xy)
-         + alpha_l1  * L1(weighted_xyz)
-         + alpha_mse * MSE(weighted_xyz)
+    z_weight: z errors penalised at this fraction of xy errors.
+      z has the same pixel scale as xy (~±48 px) but higher
+      uncertainty (depth is estimated, not directly observed).
+      0.5 works well empirically.
 
-    z_weight: down-weight z dimension.
-      z is in the same pixel scale as xy (~±48 px range) but has higher
-      label noise because depth is estimated, not directly measured.
-      z_weight=0.5 means z errors penalised at half the rate of xy.
-
-    Wing loss reference: Feng et al., CVPR 2018
+    Wing loss ref: Feng et al., CVPR 2018
       "Wing Loss for Robust Facial Landmark Localisation with CNN"
     """
 
@@ -225,14 +208,10 @@ class LandmarkDistillationLoss(nn.Module):
         self.z_weight   = z_weight
         self.wing_w     = wing_w
         self.wing_eps   = wing_eps
-        # Precompute Wing constant C = w - w*ln(1 + w/eps)
-        self._wing_C = wing_w - wing_w * math.log(1.0 + wing_w / wing_eps)
+        self._wing_C    = wing_w - wing_w * math.log(1.0 + wing_w / wing_eps)
 
     def _wing(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Wing loss on xy coordinates only.
-        pred/target : (N, 68, 2)
-        """
+        """Wing loss on xy only. pred/target: (N, 68, 2)"""
         diff = (pred - target).abs()
         loss = torch.where(
             diff < self.wing_w,
@@ -241,36 +220,28 @@ class LandmarkDistillationLoss(nn.Module):
         )
         return loss.mean()
 
-    def _apply_z_weight(
+    def _weighted(
         self, pred: torch.Tensor, target: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns tensors where the z channel is multiplied by z_weight.
-        pred/target : (N, 68, 3)
-        """
-        w = torch.ones(3, device=pred.device, dtype=pred.dtype)
+    ) -> tuple:
+        """Apply z_weight to z channel. Returns weighted (pred, target)."""
+        w = torch.ones(LMK_DIM, device=pred.device, dtype=pred.dtype)
         w[2] = self.z_weight
-        # broadcast: (1, 1, 3)
-        w = w.view(1, 1, 3)
+        w = w.view(1, 1, LMK_DIM)
         return pred * w, target * w
 
     def forward(
         self,
-        pred:   torch.Tensor,   # (N, 68, 3)  student output
-        target: torch.Tensor,   # (N, 68, 3)  teacher labels
-    ) -> tuple[torch.Tensor, dict]:
-
-        # Wing loss — xy only
+        pred:   torch.Tensor,   # (N, 68, 3)
+        target: torch.Tensor,   # (N, 68, 3)
+    ) -> tuple:
         loss_wing = self._wing(pred[:, :, :2], target[:, :, :2])
-
-        # L1 + MSE — all dims with z weighting
-        p_w, t_w = self._apply_z_weight(pred, target)
-        loss_l1  = F.l1_loss(p_w, t_w)
-        loss_mse = F.mse_loss(p_w, t_w)
+        p_w, t_w  = self._weighted(pred, target)
+        loss_l1   = F.l1_loss(p_w, t_w)
+        loss_mse  = F.mse_loss(p_w, t_w)
 
         total = (
             self.alpha_wing * loss_wing
-            + self.alpha_l1 * loss_l1
+            + self.alpha_l1  * loss_l1
             + self.alpha_mse * loss_mse
         )
 
@@ -282,43 +253,37 @@ class LandmarkDistillationLoss(nn.Module):
         }
 
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # Metric: NME%
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
-def compute_nme(
-    pred:   torch.Tensor,   # (N, 68, 3)
-    target: torch.Tensor,   # (N, 68, 3)
-) -> float:
+def compute_nme(pred: torch.Tensor, target: torch.Tensor) -> float:
     """
-    Normalised Mean Error (%) — inter-ocular distance normalised.
+    Normalised Mean Error (%) using inter-ocular distance.
 
-    68-point scheme (same as 300W / IBUG):
-      Left  eye corners : indices 36-41  (mean = left  eye centre)
-      Right eye corners : indices 42-47  (mean = right eye centre)
+    68-point IBUG/300W scheme:
+      Left  eye corners : indices 36–41  (mean = left  eye centre)
+      Right eye corners : indices 42–47  (mean = right eye centre)
 
-    Only xy used; z excluded (not part of standard NME definition).
-    Lower is better. SOTA on 300W: ~3-4%.
+    Only xy used (z excluded from standard NME definition).
+    Lower is better. Teacher on aligned crops: ~2–3%. Good student: < 4%.
     """
     pred_xy   = pred[:, :, :2]     # (N, 68, 2)
     target_xy = target[:, :, :2]
 
-    # Inter-ocular distance from teacher labels
-    left_eye_c  = target_xy[:, 36:42, :].mean(dim=1)   # (N, 2)
-    right_eye_c = target_xy[:, 42:48, :].mean(dim=1)   # (N, 2)
-    iod         = (left_eye_c - right_eye_c).norm(dim=1).clamp(min=1e-6)  # (N,)
+    left_eye  = target_xy[:, 36:42, :].mean(dim=1)    # (N, 2)
+    right_eye = target_xy[:, 42:48, :].mean(dim=1)    # (N, 2)
+    iod       = (left_eye - right_eye).norm(dim=1).clamp(min=1e-6)  # (N,)
 
-    # Mean Euclidean error across 68 landmarks
-    diff      = (pred_xy - target_xy).norm(dim=2)       # (N, 68)
-    mean_err  = diff.mean(dim=1)                        # (N,)
+    diff     = (pred_xy - target_xy).norm(dim=2)       # (N, 68)
+    mean_err = diff.mean(dim=1)                         # (N,)
 
-    nme = (mean_err / iod).mean().item() * 100.0        # percentage
-    return nme
+    return (mean_err / iod).mean().item() * 100.0
 
 
-# ============================================================
-# RAM helper
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# RAM helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
 def estimate_dataset_ram_gb(data_dir: str) -> float:
     chunk_files = sorted(glob.glob(os.path.join(data_dir, "chunk_*.npz")))
@@ -343,24 +308,22 @@ def should_stream(data_dir: str, headroom_gb: float = 40.0) -> bool:
     return not fits
 
 
-# ============================================================
-# Augmentation pipeline
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# Augmentation
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _build_transforms(augment: bool):
+def _build_transform(augment: bool) -> transforms.Compose:
     """
-    NOTE: RandomGrayscale is intentionally omitted.
-    The teacher was run on RGB images; grayscale inputs create a
-    distribution shift that degrades landmark accuracy.
+    Safe augmentations for landmark distillation.
 
-    Horizontal flip is ALSO omitted here because flipping a face
-    requires remapping landmark indices (left<->right symmetry pairs)
-    which is non-trivial for 68-point scheme. Keeping augmentation
-    simple avoids label corruption.
+    RandomHorizontalFlip: OMITTED — requires remapping 68-pt landmark pairs.
+    RandomGrayscale    : OMITTED — teacher was run on RGB; distribution mismatch.
+    ColorJitter        : safe, does not affect spatial coordinates.
+    GaussianBlur       : safe, does not affect spatial coordinates.
     """
+    steps = [transforms.ToPILImage()]
     if augment:
-        return transforms.Compose([
-            transforms.ToPILImage(),
+        steps += [
             transforms.RandomApply([
                 transforms.ColorJitter(
                     brightness=0.3,
@@ -372,38 +335,35 @@ def _build_transforms(augment: bool):
             transforms.RandomApply([
                 transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
             ], p=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
-    else:
-        return transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        ]
+    steps += [
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ]
+    return transforms.Compose(steps)
 
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # Dataset — in-memory
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 class DistillationDataset(Dataset):
     """
-    Loads all chunks into RAM.
+    Loads all chunks into RAM at init.
 
-    At 1M samples @ 192x192:
-      images     ≈ 107  GB
-      landmarks  ≈   0.8 GB
-      total      ≈ 107.8 GB
+    At 1M samples @ 192×192:
+      images    ≈ 106 GB
+      landmarks ≈   0.8 GB
+      total     ≈ 107 GB
 
-    Only feasible on machines with ≥ 150 GB RAM (e.g. H200 node).
-    Use stream_dataset='auto' to auto-select.
+    Only feasible on machines with ≥ 150 GB available RAM.
+    Use stream_dataset='auto' to let the code decide.
     """
 
     def __init__(self, data_dir: str, augment: bool = True,
                  val_split: float = 0.01):
-        self.transform    = _build_transforms(augment)
-        self.transform_val = _build_transforms(False)
+        self.transform     = _build_transform(augment)
+        self.transform_val = _build_transform(False)
 
         chunk_files = sorted(glob.glob(os.path.join(data_dir, "chunk_*.npz")))
         if not chunk_files:
@@ -424,14 +384,14 @@ class DistillationDataset(Dataset):
         del all_images, all_landmarks
         gc.collect()
 
-        n_val          = max(1, int(len(images) * val_split))
+        n_val              = max(1, int(len(images) * val_split))
         self.val_images    = images[:n_val]
         self.val_landmarks = landmarks[:n_val]
         self.images        = images[n_val:]
         self.landmarks     = landmarks[n_val:]
 
         print(f"Train: {len(self.images):,}  Val: {len(self.val_images):,}")
-        print(f"RAM : images={images.nbytes/1e9:.1f} GB  "
+        print(f"RAM   : images={images.nbytes/1e9:.1f} GB  "
               f"landmarks={landmarks.nbytes/1e6:.1f} MB")
 
     def __len__(self):
@@ -443,36 +403,29 @@ class DistillationDataset(Dataset):
         return img, lmk
 
     def get_val_dataset(self) -> 'DistillationDataset':
-        """Returns a lightweight val wrapper over the held-out slice."""
-        ds             = object.__new__(DistillationDataset)
-        ds.transform   = self.transform_val
-        ds.images      = self.val_images
-        ds.landmarks   = self.val_landmarks
+        """Lightweight val wrapper over the held-out slice."""
+        ds            = object.__new__(DistillationDataset)
+        ds.transform  = self.transform_val
+        ds.images     = self.val_images
+        ds.landmarks  = self.val_landmarks
         return ds
 
-    # Make the val wrapper usable as a Dataset
-    def __len2__(self):
-        return len(self.images)
 
-
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # Dataset — streaming
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 class LargeDistillationDataset(IterableDataset):
     """
-    Streams chunks from disk. Works for any dataset size.
+    Streams chunks from disk — works for any dataset size.
     Holds one chunk (~1 GB) in RAM at a time.
-
-    Worker-aware: each DataLoader worker reads a disjoint subset of chunks.
+    Each DataLoader worker reads a disjoint subset of chunks.
     """
 
     def __init__(self, data_dir: str, augment: bool = True,
-                 shuffle: bool = True, skip_first_n: int = 0):
-        self.augment        = augment
-        self.shuffle        = shuffle
-        self.skip_first_n   = skip_first_n     # used to carve out val set
-        self.transform      = _build_transforms(augment)
+                 shuffle: bool = True):
+        self.transform   = _build_transform(augment)
+        self.shuffle     = shuffle
 
         self.chunk_files = sorted(glob.glob(os.path.join(data_dir, "chunk_*.npz")))
         if not self.chunk_files:
@@ -480,12 +433,9 @@ class LargeDistillationDataset(IterableDataset):
 
         print(f"Indexing {len(self.chunk_files)} chunks...")
         self._total = 0
-        self._chunk_lengths = []
         for f in tqdm(self.chunk_files, desc="Indexing"):
             d = np.load(f, mmap_mode='r')
-            n = len(d['landmarks'])
-            self._chunk_lengths.append(n)
-            self._total += n
+            self._total += len(d['landmarks'])
             d.close()
         print(f"Total samples: {self._total:,}")
 
@@ -523,9 +473,9 @@ class LargeDistillationDataset(IterableDataset):
             gc.collect()
 
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # Training loop
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 def train(config: dict):
     print("=" * 60)
@@ -547,7 +497,7 @@ def train(config: dict):
         json.dump(config, f, indent=2)
 
     # ── Dataset ───────────────────────────────────────────────
-    print("\nChecking dataset vs RAM...")
+    print("\nChecking dataset vs available RAM...")
     stream = config['stream_dataset']
     if stream == 'auto':
         stream = should_stream(config['data_dir'], headroom_gb=40.0)
@@ -556,41 +506,41 @@ def train(config: dict):
         av = psutil.virtual_memory().available / 1e9
         print(f"  Dataset  : {gb:.1f} GB   Available: {av:.1f} GB")
         if not stream and gb > av - 40.0:
-            print(f"  WARNING: stream_dataset=False but dataset ({gb:.1f} GB) "
-                  f"may exceed available RAM ({av:.1f} GB)")
+            print(f"  WARNING : stream_dataset=False but dataset ({gb:.1f} GB) "
+                  f"may exceed available RAM ({av:.1f} GB). "
+                  f"Consider stream_dataset='auto'.")
 
     if stream:
-        print("\nUsing LargeDistillationDataset (streaming)")
-        train_ds    = LargeDistillationDataset(
+        print("\nUsing LargeDistillationDataset (streaming from disk)")
+        train_ds       = LargeDistillationDataset(
             config['data_dir'], augment=True, shuffle=True
         )
-        # Hold out first chunk as validation (no augment)
-        val_ds      = LargeDistillationDataset(
+        val_ds         = LargeDistillationDataset(
             config['data_dir'], augment=False, shuffle=False
         )
-        # Limit val to first 1000 samples via a wrapper
-        val_ds._total       = min(1000, val_ds._total)
-        val_ds.chunk_files  = val_ds.chunk_files[:1]
+        # Restrict val to first chunk only (~10 000 samples)
+        val_ds.chunk_files = val_ds.chunk_files[:1]
+        val_ds._total      = min(10_000, val_ds._total)
         shuffle_loader = False
     else:
         print("\nUsing DistillationDataset (all in RAM)")
-        full_ds    = DistillationDataset(
+        full_ds        = DistillationDataset(
             config['data_dir'], augment=True, val_split=0.01
         )
-        train_ds   = full_ds
-        val_ds     = full_ds.get_val_dataset()
+        train_ds       = full_ds
+        val_ds         = full_ds.get_val_dataset()
         shuffle_loader = True
 
     train_loader = DataLoader(
         train_ds,
-        batch_size       = config['batch_size'],
-        shuffle          = shuffle_loader,
-        num_workers      = config['num_workers'],
-        pin_memory       = True,
-        pin_memory_device= 'cuda:0',
-        drop_last        = True,
-        persistent_workers = True,
-        prefetch_factor  = 4,
+        batch_size        = config['batch_size'],
+        shuffle           = shuffle_loader,
+        num_workers       = config['num_workers'],
+        pin_memory        = True,
+        pin_memory_device = 'cuda:0',
+        drop_last         = True,
+        persistent_workers= True,
+        prefetch_factor   = 4,
     )
 
     val_loader = DataLoader(
@@ -611,14 +561,14 @@ def train(config: dict):
     if config['model_size'] not in model_map:
         raise ValueError(
             f"Unknown model_size '{config['model_size']}'. "
-            f"Choose: {list(model_map.keys())}"
+            f"Choose from: {list(model_map.keys())}"
         )
     model = model_map[config['model_size']]().to(device)
 
     total_p     = sum(p.numel() for p in model.parameters())
     trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel      : StudentModel{config['model_size'].capitalize()}")
-    print(f"Parameters : {total_p:,} total  {trainable_p:,} trainable")
+    print(f"Parameters : {total_p:,} total   {trainable_p:,} trainable")
 
     # ── Loss ──────────────────────────────────────────────────
     criterion = LandmarkDistillationLoss(
@@ -628,13 +578,14 @@ def train(config: dict):
         z_weight   = config['z_weight'],
     )
 
-    # ── Optimiser + LR schedule ───────────────────────────────
+    # ── Optimiser ─────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr           = config['learning_rate'],
         weight_decay = config['weight_decay'],
     )
 
+    # ── LR schedule: linear warmup + cosine decay ─────────────
     total_steps  = len(train_loader) * config['epochs']
     warmup_steps = len(train_loader) * config.get('warmup_epochs', 3)
 
@@ -662,19 +613,19 @@ def train(config: dict):
         best_nme    = ckpt.get('nme', float('inf'))
         print(f"Resumed from {config['resume_from']} (epoch {start_epoch})")
 
-    # ── Train ─────────────────────────────────────────────────
-    print(f"\nTraining for {config['epochs']} epochs "
-          f"(start={start_epoch + 1})")
+    print(f"\nStarting training for {config['epochs']} epochs "
+          f"(from epoch {start_epoch + 1})")
     print(f"Total steps  : {total_steps:,}")
     print(f"Warmup steps : {warmup_steps:,}")
 
     history = []
 
     for epoch in range(start_epoch, config['epochs']):
-        # ── Train epoch ───────────────────────────────────────
+
+        # ── Train ─────────────────────────────────────────────
         model.train()
-        ep_losses   = {'wing': 0., 'l1': 0., 'mse': 0., 'total': 0.}
-        n_batches   = 0
+        ep_losses = {'wing': 0., 'l1': 0., 'mse': 0., 'total': 0.}
+        n_batches = 0
 
         pbar = tqdm(
             train_loader,
@@ -721,7 +672,7 @@ def train(config: dict):
 
         # ── Validation NME ────────────────────────────────────
         model.eval()
-        all_nme = []
+        nme_list = []
         with torch.no_grad():
             for images, teacher_lmk in val_loader:
                 images      = images.to(device)
@@ -731,21 +682,19 @@ def train(config: dict):
                         student_lmk = model(images)
                 else:
                     student_lmk = model(images)
-                all_nme.append(compute_nme(student_lmk, teacher_lmk))
+                nme_list.append(compute_nme(student_lmk, teacher_lmk))
 
-        val_nme = float(np.mean(all_nme))
+        val_nme = float(np.mean(nme_list))
 
-        print(f"\nEpoch {epoch+1} | "
-              f"loss={avg['total']:.5f}  wing={avg['wing']:.5f}  "
-              f"l1={avg['l1']:.5f}  mse={avg['mse']:.5f}  "
+        print(f"\nEpoch {epoch+1:>3} | "
+              f"loss={avg['total']:.5f}  "
+              f"wing={avg['wing']:.5f}  "
+              f"l1={avg['l1']:.5f}  "
+              f"mse={avg['mse']:.5f}  "
               f"NME={val_nme:.3f}%  "
               f"lr={scheduler.get_last_lr()[0]:.2e}")
 
-        history.append({
-            'epoch':  epoch + 1,
-            'nme':    val_nme,
-            **avg,
-        })
+        history.append({'epoch': epoch + 1, 'nme': val_nme, **avg})
 
         # ── Checkpointing ─────────────────────────────────────
         payload = {
@@ -771,8 +720,11 @@ def train(config: dict):
 
     # ── Final save ────────────────────────────────────────────
     torch.save(
-        {'epoch': config['epochs'], 'model_state_dict': model.state_dict(),
-         'config': config},
+        {
+            'epoch':            config['epochs'],
+            'model_state_dict': model.state_dict(),
+            'config':           config,
+        },
         os.path.join(save_dir, 'final_model.pth'),
     )
     with open(os.path.join(save_dir, 'history.json'), 'w') as f:
@@ -780,16 +732,16 @@ def train(config: dict):
 
     print(f"\n{'='*60}")
     print(f"Training complete!")
-    print(f"Best NME  : {best_nme:.3f}%")
-    print(f"Saved to  : {save_dir}")
+    print(f"Best NME : {best_nme:.3f}%")
+    print(f"Saved to : {save_dir}")
     print(f"{'='*60}")
 
     return save_dir
 
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # Entry point
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
 
@@ -797,20 +749,17 @@ if __name__ == "__main__":
         # ── Data ──────────────────────────────────────────────
         'data_dir':       'distill_data/ms1m_landmarks',
         'num_workers':    16,
-        # 'auto' measures RAM at runtime and picks the right dataset class.
-        # Set False to force in-RAM (fast, needs ≥150 GB available).
-        # Set True  to force streaming (safe, slightly slower).
+        # 'auto' -> measures dataset vs RAM at runtime, picks correct class
+        # False  -> always load into RAM  (needs ~150 GB available)
+        # True   -> always stream from disk (safe for any size)
         'stream_dataset': 'auto',
 
         # ── Model ─────────────────────────────────────────────
-        # 'large'  recommended — closest to teacher ResNet-50 depth
-        # 'medium' if training time is a concern
-        # 'small'  for ablation / quick debugging only
-        'model_size':     'large',
+        'model_size':     'large',   # 'small' | 'medium' | 'large'
 
         # ── Training ──────────────────────────────────────────
-        # Images are 192x192 (2.94x larger than 112x112 used by glintr100).
-        # Reduce batch_size relative to glintr100 run accordingly.
+        # Images are 192×192. Relative to glintr100 (112×112, bs=2048):
+        # memory per sample is 2.94× larger -> batch_size ~512-768
         'batch_size':     512,
         'epochs':         50,
         # LR sqrt-scaled from 1e-3 @ bs=256: 1e-3 * sqrt(512/256) = 1.41e-3
@@ -818,10 +767,10 @@ if __name__ == "__main__":
         'weight_decay':   1e-4,
         'warmup_epochs':  3,
 
-        # ── Loss weights ──────────────────────────────────────
-        'alpha_wing':     1.0,   # Wing loss on xy — primary landmark loss
-        'alpha_l1':       1.0,   # L1 on xyz (z downweighted by z_weight)
-        'alpha_mse':      0.5,   # MSE on xyz — penalises large errors hard
+        # ── Loss ──────────────────────────────────────────────
+        'alpha_wing':     1.0,   # Wing loss on xy  — primary landmark term
+        'alpha_l1':       1.0,   # L1  loss on xyz  — robust to outliers
+        'alpha_mse':      0.5,   # MSE loss on xyz  — penalises large errors
         'z_weight':       0.5,   # z error weight relative to xy
 
         # ── Saving ────────────────────────────────────────────
