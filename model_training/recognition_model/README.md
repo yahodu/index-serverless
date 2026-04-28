@@ -32,6 +32,20 @@ pv distill_data_5M.tar | tar --xattrs --acls -xf -
 watch -n 1 nvidia-smi
 
 
+# Basic — runs both models, compares results
+python 0_model_comparison.py --dir ./photos --query query.jpg
+
+# Save index so you don't re-index every time
+python 0_model_comparison.py --dir ./photos --query query.jpg --save-index index.npz
+
+# Load saved index for a new query (instant)
+python 0_model_comparison.py --load-index index_buffalo_l.npz --query new_query.jpg
+
+# Only run one model
+python 0_model_comparison.py --dir ./photos --query query.jpg --models buffalo_l
+
+# Tune threshold (lower = more matches, higher = stricter)
+python 0_model_comparison.py --dir ./photos --query query.jpg --threshold 0.35
 
 
 distilled_25M_1M, distilled_25M_5M, distilled_62M_1M, distilled_62M_5M

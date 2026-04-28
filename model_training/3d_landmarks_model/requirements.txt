@@ -10,4 +10,6 @@ mxnet==1.9.1
 insightface>=0.7.3
 scikit-learn>=1.3.0
 psutil
+onnx-simplifier
+onnxscript
 gdown
