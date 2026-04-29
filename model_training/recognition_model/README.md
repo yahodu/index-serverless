@@ -27,6 +27,13 @@ tar --xattrs --acls -cf - distill_data_5M | pv -s $(du -sb distill_data_5M | cut
 
 pv distill_data_5M.tar | tar --xattrs --acls -xf -
 
+For split tars
+tar --xattrs --acls -cf - distill_data/ms1m_landmarks \ | pv -s $(du -sb distill_data/ms1m_landmarks | cut -f1) \ | split -b 50G - distill_data.tar.part-
+
+SIZE=$(du -cb distill_data.tar.part-* | tail -1 | cut -f1)
+cat distill_data.tar.part-* \
+| pv -s $SIZE \
+| tar -xvf -
 
 
 watch -n 1 nvidia-smi

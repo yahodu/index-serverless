@@ -104,6 +104,13 @@ class LandmarkHead(nn.Module):
         layers.append(nn.Linear(in_features, NUM_LMK * LMK_DIM))
         self.fc = nn.Sequential(*layers)
 
+        # Initialise output layer to predict near the centre of the image
+        # This gives NME ~50% at epoch 0 instead of ~1000%
+        # The FC layer is always the last module in self.fc
+        final_linear = self.fc[-1]
+        nn.init.normal_(final_linear.weight, std=0.01)   # small weights
+        nn.init.constant_(final_linear.bias, 96.0)       # predict image centre (192/2)
+ 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x).view(x.size(0), NUM_LMK, LMK_DIM)
 
@@ -152,16 +159,15 @@ class StudentModelMedium(nn.Module):
 
 class StudentModelLarge(nn.Module):
     """
-    ~25 M params. IResNet-50 style — closest to teacher depth.
-    Recommended for H200 / any GPU with ≥ 16 GB VRAM.
+    ~13 M params. IResNet-50 block counts: [3, 4, 6, 3].
     """
     def __init__(self):
         super().__init__()
         self.stem   = ConvBnAct(3, 64, s=1)
-        self.layer1 = _make_layer(64,  64,   3,  2)    # 192->96
-        self.layer2 = _make_layer(64,  128,  8,  2)    # 96->48
-        self.layer3 = _make_layer(128, 256,  16, 2)    # 48->24
-        self.layer4 = _make_layer(256, 512,  3,  2)    # 24->12
+        self.layer1 = _make_layer(64,  64,  3, 2)   # 192->96
+        self.layer2 = _make_layer(64,  128, 4, 2)   # 96->48
+        self.layer3 = _make_layer(128, 256, 6, 2)   # 48->24  ← was 16
+        self.layer4 = _make_layer(256, 512, 3, 2)   # 24->12
         self.pool   = nn.AdaptiveAvgPool2d((1, 1))
         self.head   = LandmarkHead(512, dropout=0.4)
 
@@ -173,7 +179,6 @@ class StudentModelLarge(nn.Module):
         x = self.layer4(x)
         x = self.pool(x).flatten(1)
         return self.head(x)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Loss
@@ -760,17 +765,17 @@ if __name__ == "__main__":
         # ── Training ──────────────────────────────────────────
         # Images are 192×192. Relative to glintr100 (112×112, bs=2048):
         # memory per sample is 2.94× larger -> batch_size ~512-768
-        'batch_size':     512,
+        'batch_size':     2048,
         'epochs':         50,
         # LR sqrt-scaled from 1e-3 @ bs=256: 1e-3 * sqrt(512/256) = 1.41e-3
-        'learning_rate':  1.41e-3,
+        'learning_rate':  5e-4,
         'weight_decay':   1e-4,
-        'warmup_epochs':  3,
+        'warmup_epochs':  8,
 
         # ── Loss ──────────────────────────────────────────────
         'alpha_wing':     1.0,   # Wing loss on xy  — primary landmark term
         'alpha_l1':       1.0,   # L1  loss on xyz  — robust to outliers
-        'alpha_mse':      0.5,   # MSE loss on xyz  — penalises large errors
+        'alpha_mse':      0.1,   # MSE loss on xyz  — penalises large errors
         'z_weight':       0.5,   # z error weight relative to xy
 
         # ── Saving ────────────────────────────────────────────
@@ -778,7 +783,7 @@ if __name__ == "__main__":
         'save_every':     5,
 
         # ── Resume ────────────────────────────────────────────
-        # 'resume_from': 'checkpoints_landmarks/run_YYYYMMDD_HHMMSS/checkpoint_epoch_0010.pth',
+        # 'resume_from': 'checkpoints_landmarks/run_20260428_101310/checkpoint_epoch_0005.pth',
         'resume_from':    None,
     }
 
